@@ -17,33 +17,30 @@
 
 package org.apache.zeppelin.notebook;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
-import org.apache.commons.lang.StringUtils;
-import org.apache.zeppelin.conf.ZeppelinConfiguration;
-import org.apache.zeppelin.user.AuthenticationInfo;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import com.amazonaws.AmazonClientException;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.model.GetObjectRequest;
+import com.amazonaws.services.s3.model.ObjectMetadata;
+import com.amazonaws.services.s3.model.PutObjectRequest;
+import com.amazonaws.services.s3.model.S3Object;
 import com.google.common.base.Predicate;
 import com.google.common.collect.FluentIterable;
 import com.google.common.collect.Sets;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang.StringUtils;
+import org.apache.zeppelin.conf.ZeppelinConfiguration;
+import org.apache.zeppelin.notebook.repo.S3NotebookRepo;
+import org.apache.zeppelin.user.AuthenticationInfo;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Contains authorization information for notes
@@ -62,19 +59,24 @@ public class NotebookAuthorization {
   private static ZeppelinConfiguration conf;
   private static Gson gson;
   private static String filePath;
+  private static AmazonS3 s3client;
+  private static boolean useServerSideEncryption;
 
-  private NotebookAuthorization() {}
+  private NotebookAuthorization() {
+  }
 
   public static NotebookAuthorization init(ZeppelinConfiguration config) {
     if (instance == null) {
       instance = new NotebookAuthorization();
       conf = config;
+      useServerSideEncryption = conf.isS3ServerSideEncryption();
       filePath = conf.getNotebookAuthorizationPath();
       GsonBuilder builder = new GsonBuilder();
       builder.setPrettyPrinting();
       gson = builder.create();
       try {
-        loadFromFile();
+        s3client = S3NotebookRepo.createS3Client(conf);
+        load();
       } catch (IOException e) {
         LOG.error("Error loading NotebookAuthorization", e);
       }
@@ -89,6 +91,42 @@ public class NotebookAuthorization {
       init(ZeppelinConfiguration.create());
     }
     return instance;
+  }
+
+  public static void load() throws IOException {
+    LOG.info("filePath is " + filePath);
+    if (filePath.startsWith("s3")) {
+      loadFromS3();
+    } else {
+      loadFromFile();
+    }
+  }
+
+  private static void loadFromS3() throws IOException {
+    S3Object s3object;
+    Pattern s3pattern = Pattern.compile("^s3://([^/]+)/(.*)$");
+    Matcher s3matcher = s3pattern.matcher(filePath);
+    String bucketName = "";
+    String key = "";
+    if (s3matcher.find()) {
+      bucketName = s3matcher.group(1);
+      key = s3matcher.group(2);
+    }
+    LOG.info("Loading notebook authorization from s3 with bucketName=" + bucketName
+        + "and key=" + key);
+    try {
+      s3object = s3client.getObject(new GetObjectRequest(bucketName, key));
+    } catch (AmazonClientException ace) {
+      throw new IOException("Unable to retrieve object from S3: " + ace, ace);
+    }
+    try (InputStream ins = s3object.getObjectContent()) {
+      String json = IOUtils.toString(ins,
+          conf.getString(ZeppelinConfiguration.ConfVars.ZEPPELIN_ENCODING));
+      NotebookAuthorizationInfoSaving info = gson.fromJson(json,
+          NotebookAuthorizationInfoSaving.class);
+      authInfo = info.authInfo;
+    }
+    LOG.info("Loading notebook authorization done!");
   }
 
   private static void loadFromFile() throws IOException {
@@ -110,11 +148,12 @@ public class NotebookAuthorization {
     fis.close();
 
     String json = sb.toString();
+
     NotebookAuthorizationInfoSaving info = gson.fromJson(json,
-            NotebookAuthorizationInfoSaving.class);
+        NotebookAuthorizationInfoSaving.class);
     authInfo = info.authInfo;
   }
-  
+
   public void setRoles(String user, Set<String> roles) {
     if (StringUtils.isBlank(user)) {
       LOG.warn("Setting roles for empty user");
@@ -123,7 +162,7 @@ public class NotebookAuthorization {
     roles = validateUser(roles);
     userRoles.put(user, roles);
   }
-  
+
   public Set<String> getRoles(String user) {
     Set<String> roles = Sets.newHashSet();
     if (userRoles.containsKey(user)) {
@@ -131,7 +170,57 @@ public class NotebookAuthorization {
     }
     return roles;
   }
-  
+
+  private void save() {
+    if (filePath.startsWith("s3")) {
+      saveToS3();
+    } else {
+      saveToFile();
+    }
+  }
+
+  private void saveToS3() {
+    Pattern s3pattern = Pattern.compile("^s3://([^/]+)/(.*)$");
+    Matcher s3matcher = s3pattern.matcher(filePath);
+    String bucketName = "";
+    String key = "";
+    if (s3matcher.find()) {
+      bucketName = s3matcher.group(1);
+      key = s3matcher.group(2);
+    }
+
+    String jsonString;
+
+    synchronized (authInfo) {
+      NotebookAuthorizationInfoSaving info = new NotebookAuthorizationInfoSaving();
+      info.authInfo = authInfo;
+      jsonString = gson.toJson(info);
+    }
+
+    try {
+      File file = File.createTempFile("authorization", "json");
+      try {
+        Writer writer = new OutputStreamWriter(new FileOutputStream(file));
+        writer.write(jsonString);
+        writer.close();
+        PutObjectRequest putRequest = new PutObjectRequest(bucketName, key, file);
+        if (useServerSideEncryption) {
+          // Request server-side encryption.
+          ObjectMetadata objectMetadata = new ObjectMetadata();
+          objectMetadata.setSSEAlgorithm(ObjectMetadata.AES_256_SERVER_SIDE_ENCRYPTION);
+          putRequest.setMetadata(objectMetadata);
+        }
+        s3client.putObject(putRequest);
+      } catch (AmazonClientException ace) {
+        throw new IOException("Unable to store note in S3: " + ace, ace);
+      } finally {
+        FileUtils.deleteQuietly(file);
+      }
+    } catch (IOException e) {
+      LOG.error("Error saving notebook authorization file: " + e.getMessage());
+    }
+  }
+
   private void saveToFile() {
     String jsonString;
 
@@ -156,7 +245,7 @@ public class NotebookAuthorization {
       LOG.error("Error saving notebook authorization file: " + e.getMessage());
     }
   }
-  
+
   public boolean isPublic() {
     return conf.isNotebokPublic();
   }
@@ -183,7 +272,7 @@ public class NotebookAuthorization {
       noteAuthInfo.put("owners", new LinkedHashSet(entities));
     }
     authInfo.put(noteId, noteAuthInfo);
-    saveToFile();
+    save();
   }
 
   public void setReaders(String noteId, Set<String> entities) {
@@ -198,7 +287,7 @@ public class NotebookAuthorization {
       noteAuthInfo.put("readers", new LinkedHashSet(entities));
     }
     authInfo.put(noteId, noteAuthInfo);
-    saveToFile();
+    save();
   }
 
   public void setWriters(String noteId, Set<String> entities) {
@@ -213,7 +302,7 @@ public class NotebookAuthorization {
       noteAuthInfo.put("writers", new LinkedHashSet(entities));
     }
     authInfo.put(noteId, noteAuthInfo);
-    saveToFile();
+    save();
   }
 
   public Set<String> getOwners(String noteId) {
@@ -268,8 +357,8 @@ public class NotebookAuthorization {
 
   public boolean isReader(String noteId, Set<String> entities) {
     return isMember(entities, getReaders(noteId)) ||
-            isMember(entities, getOwners(noteId)) ||
-            isMember(entities, getWriters(noteId));
+        isMember(entities, getOwners(noteId)) ||
+        isMember(entities, getWriters(noteId));
   }
 
   // return true if b is empty or if (a intersection b) is non-empty
@@ -289,7 +378,7 @@ public class NotebookAuthorization {
     }
     return isOwner(noteId, userAndRoles);
   }
-  
+
   public boolean hasWriteAuthorization(Set<String> userAndRoles, String noteId) {
     if (conf.isAnonymousAllowed()) {
       LOG.debug("Zeppelin runs in anonymous mode, everybody is writer");
@@ -300,7 +389,7 @@ public class NotebookAuthorization {
     }
     return isWriter(noteId, userAndRoles);
   }
-  
+
   public boolean hasReadAuthorization(Set<String> userAndRoles, String noteId) {
     if (conf.isAnonymousAllowed()) {
       LOG.debug("Zeppelin runs in anonymous mode, everybody is reader");
@@ -314,7 +403,7 @@ public class NotebookAuthorization {
 
   public void removeNote(String noteId) {
     authInfo.remove(noteId);
-    saveToFile();
+    save();
   }
 
   public List<NoteInfo> filterByUser(List<NoteInfo> notes, AuthenticationInfo subject) {
@@ -329,7 +418,7 @@ public class NotebookAuthorization {
       }
     }).toList();
   }
-  
+
   public void setNewNotePermissions(String noteId, AuthenticationInfo subject) {
     if (!AuthenticationInfo.isAnonymous(subject)) {
       if (isPublic()) {

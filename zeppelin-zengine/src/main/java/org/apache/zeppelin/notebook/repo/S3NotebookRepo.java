@@ -17,18 +17,17 @@
 
 package org.apache.zeppelin.notebook.repo;
 
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
-import java.util.Collections;
-import java.util.Date;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-
+import com.amazonaws.AmazonClientException;
+import com.amazonaws.auth.AWSCredentialsProvider;
+import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+import com.amazonaws.regions.Region;
+import com.amazonaws.regions.Regions;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3Client;
+import com.amazonaws.services.s3.AmazonS3EncryptionClient;
+import com.amazonaws.services.s3.model.*;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -43,25 +42,8 @@ import org.apache.zeppelin.user.AuthenticationInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.amazonaws.AmazonClientException;
-import com.amazonaws.auth.AWSCredentialsProvider;
-import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
-import com.amazonaws.services.s3.AmazonS3;
-import com.amazonaws.services.s3.AmazonS3Client;
-import com.amazonaws.services.s3.AmazonS3EncryptionClient;
-import com.amazonaws.services.s3.model.CryptoConfiguration;
-import com.amazonaws.services.s3.model.EncryptionMaterialsProvider;
-import com.amazonaws.services.s3.model.GetObjectRequest;
-import com.amazonaws.services.s3.model.KMSEncryptionMaterialsProvider;
-import com.amazonaws.services.s3.model.ListObjectsRequest;
-import com.amazonaws.services.s3.model.ObjectListing;
-import com.amazonaws.services.s3.model.PutObjectRequest;
-import com.amazonaws.regions.Region;
-import com.amazonaws.regions.Regions;
-import com.amazonaws.services.s3.model.S3Object;
-import com.amazonaws.services.s3.model.S3ObjectSummary;
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
+import java.io.*;
+import java.util.*;
 
 /**
  * Backend for storing Notebooks on S3
@@ -86,14 +68,20 @@ public class S3NotebookRepo implements NotebookRepo {
   private final AmazonS3 s3client;
   private final String bucketName;
   private final String user;
+  private final boolean useServerSideEncryption;
   private final ZeppelinConfiguration conf;
 
   public S3NotebookRepo(ZeppelinConfiguration conf) throws IOException {
     this.conf = conf;
     bucketName = conf.getBucketName();
     user = conf.getUser();
+    useServerSideEncryption = conf.isS3ServerSideEncryption();
+    this.s3client = createS3Client(conf);
+  }
 
+  public static AmazonS3 createS3Client(ZeppelinConfiguration conf) throws IOException {
     // always use the default provider chain
+    AmazonS3 s3client = null;
     AWSCredentialsProvider credentialsProvider = new DefaultAWSCredentialsProviderChain();
     CryptoConfiguration cryptoConf = null;
     String keyRegion = conf.getS3KMSKeyRegion();
@@ -102,37 +90,39 @@ public class S3NotebookRepo implements NotebookRepo {
       cryptoConf = new CryptoConfiguration();
       cryptoConf.setAwsKmsRegion(Region.getRegion(Regions.fromName(keyRegion)));
     }
-    
+
     // see if we should be encrypting data in S3
     String kmsKeyID = conf.getS3KMSKeyID();
     if (kmsKeyID != null) {
       // use the AWS KMS to encrypt data
       KMSEncryptionMaterialsProvider emp = new KMSEncryptionMaterialsProvider(kmsKeyID);
       if (cryptoConf != null) {
-        this.s3client = new AmazonS3EncryptionClient(credentialsProvider, emp, cryptoConf);
+        s3client = new AmazonS3EncryptionClient(credentialsProvider, emp, cryptoConf);
       } else {
-        this.s3client = new AmazonS3EncryptionClient(credentialsProvider, emp);
+        s3client = new AmazonS3EncryptionClient(credentialsProvider, emp);
       }
     }
     else if (conf.getS3EncryptionMaterialsProviderClass() != null) {
       // use a custom encryption materials provider class
       EncryptionMaterialsProvider emp = createCustomProvider(conf);
-      this.s3client = new AmazonS3EncryptionClient(credentialsProvider, emp);
+      s3client = new AmazonS3EncryptionClient(credentialsProvider, emp);
     }
     else {
       // regular S3
-      this.s3client = new AmazonS3Client(credentialsProvider);
+      s3client = new AmazonS3Client(credentialsProvider);
     }
 
     // set S3 endpoint to use
     s3client.setEndpoint(conf.getEndpoint());
+
+    return s3client;
   }
 
   /**
    * Create an instance of a custom encryption materials provider class
    * which supplies encryption keys to use when reading/writing data in S3.
    */
-  private EncryptionMaterialsProvider createCustomProvider(ZeppelinConfiguration conf)
+  public static EncryptionMaterialsProvider createCustomProvider(ZeppelinConfiguration conf)
       throws IOException {
     // use a custom encryption materials provider class
     String empClassname = conf.getS3EncryptionMaterialsProviderClass();
@@ -234,7 +224,14 @@ public class S3NotebookRepo implements NotebookRepo {
       Writer writer = new OutputStreamWriter(new FileOutputStream(file));
       writer.write(json);
       writer.close();
-      s3client.putObject(new PutObjectRequest(bucketName, key, file));
+      PutObjectRequest putRequest = new PutObjectRequest(bucketName, key, file);
+      if (useServerSideEncryption) {
+        // Request server-side encryption.
+        ObjectMetadata objectMetadata = new ObjectMetadata();
+        objectMetadata.setSSEAlgorithm(ObjectMetadata.AES_256_SERVER_SIDE_ENCRYPTION);
+        putRequest.setMetadata(objectMetadata);
+      }
+      s3client.putObject(putRequest);
     }
     catch (AmazonClientException ace) {
       throw new IOException("Unable to store note in S3: " + ace, ace);

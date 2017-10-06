@@ -46,6 +46,7 @@ function HomeCtrl($scope, noteListDataFactory, websocketMsgSrv, $rootScope, arra
   $scope.query = {q: ''};
 
   $scope.initHome = function() {
+    websocketMsgSrv.reloadAllNotesFromRepo();
     websocketMsgSrv.getHomeNote();
     vm.noteCustomHome = false;
   };

@@ -17,13 +17,6 @@
 
 package org.apache.zeppelin.conf;
 
-import java.io.File;
-import java.net.URL;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
 import org.apache.commons.configuration.ConfigurationException;
 import org.apache.commons.configuration.XMLConfiguration;
 import org.apache.commons.configuration.tree.ConfigurationNode;
@@ -32,6 +25,13 @@ import org.apache.zeppelin.notebook.repo.GitNotebookRepo;
 import org.apache.zeppelin.util.Util;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.net.URL;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
 /**
  * Zeppelin configuration.
@@ -353,6 +353,10 @@ public class ZeppelinConfiguration extends XMLConfiguration {
     return getString(ConfVars.ZEPPELIN_NOTEBOOK_DIR);
   }
 
+  public String getNotebookStorage() {
+    return getString(ConfVars.ZEPPELIN_NOTEBOOK_STORAGE);
+  }
+
   public String getUser() {
     return getString(ConfVars.ZEPPELIN_NOTEBOOK_S3_USER);
   }
@@ -375,6 +379,10 @@ public class ZeppelinConfiguration extends XMLConfiguration {
 
   public String getS3EncryptionMaterialsProviderClass() {
     return getString(ConfVars.ZEPPELIN_NOTEBOOK_S3_EMP);
+  }
+
+  public boolean isS3ServerSideEncryption() {
+    return getBoolean(ConfVars.ZEPPELIN_NOTEBOOK_S3_SSE);
   }
 
   public String getInterpreterListPath() {
@@ -406,7 +414,11 @@ public class ZeppelinConfiguration extends XMLConfiguration {
   }
 
   public String getNotebookAuthorizationPath() {
-    return getRelativeDir(String.format("%s/notebook-authorization.json", getConfDir()));
+    if (getNotebookStorage().contains("S3")) {
+      return String.format("s3://%s/%s/notebook-authorization.json", getBucketName(), getUser());
+    } else {
+      return getRelativeDir(String.format("%s/notebook-authorization.json", getConfDir()));
+    }
   }
 
   public Boolean credentialsPersist() {
@@ -613,6 +625,7 @@ public class ZeppelinConfiguration extends XMLConfiguration {
     ZEPPELIN_NOTEBOOK_S3_EMP("zeppelin.notebook.s3.encryptionMaterialsProvider", null),
     ZEPPELIN_NOTEBOOK_S3_KMS_KEY_ID("zeppelin.notebook.s3.kmsKeyID", null),
     ZEPPELIN_NOTEBOOK_S3_KMS_KEY_REGION("zeppelin.notebook.s3.kmsKeyRegion", null),
+    ZEPPELIN_NOTEBOOK_S3_SSE("zeppelin.notebook.s3.sse", false),
     ZEPPELIN_NOTEBOOK_AZURE_CONNECTION_STRING("zeppelin.notebook.azure.connectionString", null),
     ZEPPELIN_NOTEBOOK_AZURE_SHARE("zeppelin.notebook.azure.share", "zeppelin"),
     ZEPPELIN_NOTEBOOK_AZURE_USER("zeppelin.notebook.azure.user", "user"),
